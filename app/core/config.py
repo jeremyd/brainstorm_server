@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     stale_ongoing_brainstorm_request_check_interval_minutes: float = Field(default=30.0)
     block_frequent_graperank_requests: bool = Field(default=False)
     block_frequent_graperank_requests_minutes: int = Field(default=30)
+    run_api_server: bool = Field(default=True)
+    run_workers: bool = Field(default=True)
+    worker_concurrency: int = Field(default=1)
+    ta_publish_batch_size: int = Field(default=50)
 
     class Config:
         env_file = ".env"

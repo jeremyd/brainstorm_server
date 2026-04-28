@@ -109,15 +109,29 @@ async def get_events_from_graperank_result(
 
 
 async def process_nostr_upload_message(message: dict):
-
-    # is_success = message["result"]["success"]
-
-    # if not is_success:
-    #     return
+    private_id = message["private_id"]
 
     grape_rank_result = GrapeRankResult.model_validate(message["result"])
+
+    # Empty scorecards = the graperank run produced no usable output
+    # (Java sets success=false when relevantUsers.size() <= 1). Mirror
+    # the upstream FAILURE so reports don't count this as a successful
+    # TA publication. The important thing is to reach a TERMINAL state
+    # so the row doesn't get stuck at WAITING forever.
     if not grape_rank_result.scorecards:
+        logger.info(
+            f"[nostr upload] no scorecards for private_id={private_id}, "
+            f"marking ta_status FAILURE (nothing to publish)"
+        )
+        async with db_session() as db:
+            await update_brainstorm_request_ta_status_by_id_on_db(
+                db,
+                brainstorm_request_id=private_id,
+                status=BrainstormRequestStatus.FAILURE,
+            )
+            await db.commit()
         return
+
     observer = next(iter(grape_rank_result.scorecards.values())).observer
     # TODO: generate a new nsec for the observer of the observer
     async with db_session() as db:
@@ -129,7 +143,7 @@ async def process_nostr_upload_message(message: dict):
         assert nsec_db_obj.pubkey == observer
         await update_brainstorm_request_ta_status_by_id_on_db(
             db,
-            brainstorm_request_id=message["private_id"],
+            brainstorm_request_id=private_id,
             status=BrainstormRequestStatus.ONGOING,
         )
 
@@ -144,63 +158,108 @@ async def process_nostr_upload_message(message: dict):
 
         start_time = time.time()
 
-        # sem = asyncio.Semaphore(5)
-
-        # tasks = [
-        #     asyncio.create_task(
-        #         send_nostr_event_with_limit(nostr_client, nostr_event, index, sem)
-        #     )
-        #     for index, nostr_event in enumerate(nostr_events)
-        # ]
-
-        # await asyncio.gather(*tasks, return_exceptions=True)
-
-        for index, nostr_event in enumerate(nostr_events):
-            if index == 0 or index % 200 == 0:
-                logger.info(
-                    f"still sending nostr events for observer {observer}, progress: {index}"
-                )
-            await send_nostr_event_with_limit(nostr_client, nostr_event, index)
-
+        # Publish events in parallel batches
+        success_count, failure_count = await publish_events_in_batches(
+            nostr_client, nostr_events, settings.ta_publish_batch_size
+        )
+        
+        total_events = len(nostr_events)
+        success_rate = (success_count / total_events * 100) if total_events > 0 else 0
+        
+        logger.info(
+            f"Published {success_count}/{total_events} events successfully "
+            f"({success_rate:.1f}%) for private_id={private_id}"
+        )
+        
+        # Mark as FAILURE if more than 50% failed
+        final_status = BrainstormRequestStatus.SUCCESS
+        if failure_count > success_count:
+            final_status = BrainstormRequestStatus.FAILURE
+            logger.error(
+                f"Marking private_id={private_id} as FAILURE: "
+                f"{failure_count} failures > {success_count} successes"
+            )
+        
         async with db_session() as db:
-
             await update_brainstorm_request_ta_status_by_id_on_db(
                 db,
-                brainstorm_request_id=message["private_id"],
-                status=BrainstormRequestStatus.SUCCESS,
+                brainstorm_request_id=private_id,
+                status=final_status,
             )
-
             await db.commit()
 
         final_time = round(time.time() - start_time)
         logger.info(
-            f"Took {final_time} seconds to process {len(nostr_events)} nostr events"
+            f"Took {final_time} seconds to process {total_events} nostr events for private_id={private_id}"
         )
-        logger.info(f"Check Nostr Event {nostr_events[0].as_json()}")
-    except Exception as e:
-        logger.error(f"Error on request {message["private_id"]} , {e}")
+        if nostr_events:
+            logger.info(f"Check Nostr Event {nostr_events[0].as_json()}")
+    except Exception:
+        logger.exception(
+            f"[nostr upload] failed for private_id={private_id}, marking ta_status FAILURE"
+        )
         async with db_session() as db:
-
             await update_brainstorm_request_ta_status_by_id_on_db(
                 db,
-                brainstorm_request_id=message["private_id"],
+                brainstorm_request_id=private_id,
                 status=BrainstormRequestStatus.FAILURE,
             )
-
             await db.commit()
 
 
 async def send_nostr_event_with_limit(
-    nostr_client: Client, nostr_event: Event, index: int  # , sem: asyncio.Semaphore
-):
-    # async with sem:
-    # print(f"sending {index}...")
-    # is_connected = [(await nostr_client.relay(x)).is_connected() for x in RELAYS]
+    nostr_client: Client, nostr_event: Event, index: int
+) -> tuple[bool, str | None]:
+    """
+    Send a single nostr event and return (success, error_message).
+    """
+    try:
+        sent_event_output = await nostr_client.send_event(nostr_event)
+        if sent_event_output.failed:
+            error_msg = str(sent_event_output.failed)
+            logger.error(f"Failed to publish event {index}: {error_msg}")
+            return (False, error_msg)
+        elif not sent_event_output.success:
+            logger.error(f"Event {index} did not succeed (no OK message)")
+            return (False, "No success confirmation")
+        return (True, None)
+    except Exception as e:
+        error_msg = str(e)
+        logger.exception(f"Exception publishing event {index}: {error_msg}")
+        return (False, error_msg)
 
-    # if not is_connected:
-    #     result = await nostr_client.try_connect(timedelta(seconds=10))
-    #     assert not bool(result.failed)
 
-    sent_event_output = await nostr_client.send_event(nostr_event)
-    if sent_event_output.failed:
-        logger.error(f"Failed to publish event: {sent_event_output.failed}")
+async def publish_events_in_batches(
+    nostr_client: Client, nostr_events: list[Event], batch_size: int
+) -> tuple[int, int]:
+    """
+    Publish events in parallel batches.
+    Returns (success_count, failure_count).
+    """
+    total_events = len(nostr_events)
+    success_count = 0
+    failure_count = 0
+    
+    for batch_start in range(0, total_events, batch_size):
+        batch_end = min(batch_start + batch_size, total_events)
+        batch = nostr_events[batch_start:batch_end]
+        
+        if batch_start == 0 or batch_start % (batch_size * 10) == 0:
+            logger.info(
+                f"Publishing batch {batch_start}-{batch_end} of {total_events} events"
+            )
+        
+        # Publish all events in this batch in parallel
+        results = await asyncio.gather(*[
+            send_nostr_event_with_limit(nostr_client, event, batch_start + i)
+            for i, event in enumerate(batch)
+        ])
+        
+        # Count successes and failures
+        for success, error in results:
+            if success:
+                success_count += 1
+            else:
+                failure_count += 1
+    
+    return success_count, failure_count

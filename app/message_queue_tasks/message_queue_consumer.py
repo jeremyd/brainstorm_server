@@ -1,5 +1,6 @@
 import asyncio
 import json
+from app.core.config import settings
 from app.core.database import db_session
 from app.core.loggr import loggr
 from app.core.redis_db import get_redis_client
@@ -90,6 +91,9 @@ async def consume_messages():
     logger.info(
         f"Connected to Redis. Waiting for messages on '{RESULTS_QUEUE_NAME}'..."
     )
+    
+    # Semaphore to limit concurrent message processing
+    sem = asyncio.Semaphore(settings.worker_concurrency)
 
     while True:
         redis_client = None
@@ -100,15 +104,30 @@ async def consume_messages():
             while True:
                 msg = await redis_client.blpop(RESULTS_QUEUE_NAME, timeout=30)
                 if msg:
+                    private_id = None
                     try:
                         _, message_bytes = msg
                         message = json.loads(message_bytes)
-                        # asyncio.create_task(process_message(message))
-                        await process_message(message)
-                    except Exception as e:
-                        logger.error(e)
+                        private_id = message.get("private_id")
+                        
+                        async with sem:
+                            logger.info(
+                                f"[{RESULTS_QUEUE_NAME}] processing result for private_id={private_id}"
+                            )
+                            await process_message(message)
+                            logger.info(
+                                f"[{RESULTS_QUEUE_NAME}] finished result for private_id={private_id}"
+                            )
+                    except Exception:
+                        logger.exception(
+                            f"[{RESULTS_QUEUE_NAME}] failed to process message "
+                            f"private_id={private_id}; request will remain 'ongoing'"
+                        )
 
-        except Exception as e:
+        except Exception:
+            logger.exception(
+                f"[{RESULTS_QUEUE_NAME}] redis consumer loop crashed, reconnecting in 2s"
+            )
             await asyncio.sleep(2)  # backoff
 
         finally:
@@ -116,7 +135,9 @@ async def consume_messages():
                 try:
                     await redis_client.close()
                 except Exception:
-                    pass
+                    logger.exception(
+                        f"[{RESULTS_QUEUE_NAME}] error closing redis client"
+                    )
 
 
 async def wait_until_graph_db_is_populated():
@@ -136,6 +157,9 @@ async def consume_strfry_plugin_messages():
     logger.info(
         f"Connected to Redis. Waiting for messages on '{STRFRY_EVENTS_QUEUE_NAME}'..."
     )
+    
+    # Semaphore to limit concurrent message processing
+    sem = asyncio.Semaphore(settings.worker_concurrency)
 
     while True:
         redis_client = None
@@ -151,14 +175,19 @@ async def consume_strfry_plugin_messages():
                     try:
                         _, message_bytes = msg
                         message = json.loads(message_bytes)
-                        # asyncio.create_task(process_message(message))
-                        async with neo4j_driver.session() as neo4j_session:
-                            await process_strfry_event(neo4j_session, message)
-                    except Exception as e:
-                        logger.error(e)
+                        
+                        async with sem:
+                            async with neo4j_driver.session() as neo4j_session:
+                                await process_strfry_event(neo4j_session, message)
+                    except Exception:
+                        logger.exception(
+                            f"[{STRFRY_EVENTS_QUEUE_NAME}] failed to process event"
+                        )
 
-        except Exception as e:
-            logger.error(f"exception {e}")
+        except Exception:
+            logger.exception(
+                f"[{STRFRY_EVENTS_QUEUE_NAME}] redis consumer loop crashed, reconnecting in 2s"
+            )
             await asyncio.sleep(2)  # backoff
 
         finally:
@@ -166,7 +195,9 @@ async def consume_strfry_plugin_messages():
                 try:
                     await redis_client.close()
                 except Exception:
-                    pass
+                    logger.exception(
+                        f"[{STRFRY_EVENTS_QUEUE_NAME}] error closing redis client"
+                    )
 
 
 async def consume_nostr_upload_messages():
@@ -174,6 +205,9 @@ async def consume_nostr_upload_messages():
     logger.info(
         f"Connected to Redis. Waiting for messages on '{UPLOAD_NOSTR_RESULTS_QUEUE_NAME}'..."
     )
+    
+    # Semaphore to limit concurrent message processing
+    sem = asyncio.Semaphore(settings.worker_concurrency)
 
     while True:
         redis_client = None
@@ -186,15 +220,30 @@ async def consume_nostr_upload_messages():
                     UPLOAD_NOSTR_RESULTS_QUEUE_NAME, timeout=30
                 )
                 if msg:
+                    private_id = None
                     try:
                         _, message_bytes = msg
                         message = json.loads(message_bytes)
-                        # asyncio.create_task(process_message(message))
-                        await process_nostr_upload_message(message)
-                    except Exception as e:
-                        logger.error(e)
+                        private_id = message.get("private_id")
+                        
+                        async with sem:
+                            logger.info(
+                                f"[{UPLOAD_NOSTR_RESULTS_QUEUE_NAME}] processing upload for private_id={private_id}"
+                            )
+                            await process_nostr_upload_message(message)
+                            logger.info(
+                                f"[{UPLOAD_NOSTR_RESULTS_QUEUE_NAME}] finished upload for private_id={private_id}"
+                            )
+                    except Exception:
+                        logger.exception(
+                            f"[{UPLOAD_NOSTR_RESULTS_QUEUE_NAME}] failed to process message "
+                            f"private_id={private_id}"
+                        )
 
-        except Exception as e:
+        except Exception:
+            logger.exception(
+                f"[{UPLOAD_NOSTR_RESULTS_QUEUE_NAME}] redis consumer loop crashed, reconnecting in 2s"
+            )
             await asyncio.sleep(2)  # backoff
 
         finally:
@@ -202,13 +251,18 @@ async def consume_nostr_upload_messages():
                 try:
                     await redis_client.close()
                 except Exception:
-                    pass
+                    logger.exception(
+                        f"[{UPLOAD_NOSTR_RESULTS_QUEUE_NAME}] error closing redis client"
+                    )
 
 
 async def consume_neo4j_write_messages():
     logger.info(
         f"Connected to Redis. Waiting for messages on '{WRITE_NEO4J_RESULTS_QUEUE_NAME}'..."
     )
+    
+    # Semaphore to limit concurrent message processing
+    sem = asyncio.Semaphore(settings.worker_concurrency)
 
     while True:
         redis_client = None
@@ -221,15 +275,24 @@ async def consume_neo4j_write_messages():
                     WRITE_NEO4J_RESULTS_QUEUE_NAME, timeout=30
                 )
                 if msg:
+                    private_id = None
                     try:
                         _, message_bytes = msg
                         message = json.loads(message_bytes)
-                        # asyncio.create_task(process_message(message))
-                        await process_neo4j_write_message(message)
-                    except Exception as e:
-                        logger.error(e)
+                        private_id = message.get("private_id")
+                        
+                        async with sem:
+                            await process_neo4j_write_message(message)
+                    except Exception:
+                        logger.exception(
+                            f"[{WRITE_NEO4J_RESULTS_QUEUE_NAME}] failed to process message "
+                            f"private_id={private_id}"
+                        )
 
-        except Exception as e:
+        except Exception:
+            logger.exception(
+                f"[{WRITE_NEO4J_RESULTS_QUEUE_NAME}] redis consumer loop crashed, reconnecting in 2s"
+            )
             await asyncio.sleep(2)  # backoff
 
         finally:
@@ -237,7 +300,9 @@ async def consume_neo4j_write_messages():
                 try:
                     await redis_client.close()
                 except Exception:
-                    pass
+                    logger.exception(
+                        f"[{WRITE_NEO4J_RESULTS_QUEUE_NAME}] error closing redis client"
+                    )
 
 
 async def consume_job_started_messages():
@@ -245,6 +310,9 @@ async def consume_job_started_messages():
     logger.info(
         f"Connected to Redis. Waiting for messages on '{JOB_STARTED_QUEUE_NAME}'..."
     )
+    
+    # Semaphore to limit concurrent message processing
+    sem = asyncio.Semaphore(settings.worker_concurrency)
 
     while True:
         redis_client = None
@@ -255,15 +323,24 @@ async def consume_job_started_messages():
             while True:
                 msg = await redis_client.blpop(JOB_STARTED_QUEUE_NAME, timeout=30)
                 if msg:
+                    private_id = None
                     try:
                         _, message_bytes = msg
                         message = json.loads(message_bytes)
-                        # asyncio.create_task(process_message(message))
-                        await process_job_started_message(message)
-                    except Exception as e:
-                        logger.error(e)
+                        private_id = message.get("id") or message.get("private_id")
+                        
+                        async with sem:
+                            await process_job_started_message(message)
+                    except Exception:
+                        logger.exception(
+                            f"[{JOB_STARTED_QUEUE_NAME}] failed to process message "
+                            f"private_id={private_id}"
+                        )
 
-        except Exception as e:
+        except Exception:
+            logger.exception(
+                f"[{JOB_STARTED_QUEUE_NAME}] redis consumer loop crashed, reconnecting in 2s"
+            )
             await asyncio.sleep(2)  # backoff
 
         finally:
@@ -271,4 +348,6 @@ async def consume_job_started_messages():
                 try:
                     await redis_client.close()
                 except Exception:
-                    pass
+                    logger.exception(
+                        f"[{JOB_STARTED_QUEUE_NAME}] error closing redis client"
+                    )

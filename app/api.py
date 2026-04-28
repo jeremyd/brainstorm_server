@@ -57,105 +57,143 @@ async def lifespan(app: FastAPI):
     # test connectivity with Neo4j
     await test_neo4j_driver()
 
-    consume_strfry_plugin_messages_task = asyncio.create_task(
-        consume_strfry_plugin_messages()
-    )
+    worker_tasks = []
 
-    if settings.perform_nostr_full_sync:
-        # populate the STRFRY relay
-        logger.info(
-            "Populating your local Brainstorm Relay. Brainstorm is deactivated until it is finished"
+    if settings.run_workers:
+        logger.info("Starting message queue workers...")
+        logger.info(f"Worker concurrency: {settings.worker_concurrency}")
+        logger.info(f"TA publish batch size: {settings.ta_publish_batch_size}")
+        
+        consume_strfry_plugin_messages_task = asyncio.create_task(
+            consume_strfry_plugin_messages()
         )
-        await nostr_event_transferer()
-        logger.info(
-            "Finished populating your local Brainstorm Relay!! Populating your Graph DB..."
-        )
+        worker_tasks.append(consume_strfry_plugin_messages_task)
 
-        await wait_until_graph_db_is_populated()
-        logger.info("Finished populating your Graph Database!! Enjoy Brainstorm!!")
+        if settings.perform_nostr_full_sync:
+            # populate the STRFRY relay
+            logger.info(
+                "Populating your local Brainstorm Relay. Brainstorm is deactivated until it is finished"
+            )
+            await nostr_event_transferer()
+            logger.info(
+                "Finished populating your local Brainstorm Relay!! Populating your Graph DB..."
+            )
+
+            await wait_until_graph_db_is_populated()
+            logger.info("Finished populating your Graph Database!! Enjoy Brainstorm!!")
+        else:
+            logger.info(
+                "Skipping intial nostr relay full sync... if you want to do it, modify the env variables and restart."
+            )
+        # start the regular update cronjob task
+        # regular_update_task = asyncio.create_task(nostr_event_recent_transferer_cronjob())
+        # worker_tasks.append(regular_update_task)
+
+        # Start the listener tasks
+        listener_task = asyncio.create_task(consume_messages())
+        listener_nostr_upload_task = asyncio.create_task(consume_nostr_upload_messages())
+        listener_neo4j_write_task = asyncio.create_task(consume_neo4j_write_messages())
+        listener_ongoing_job_task = asyncio.create_task(consume_job_started_messages())
+        fail_stale_ongoing_task = asyncio.create_task(
+            fail_stale_ongoing_brainstorm_requests_cronjob()
+        )
+        
+        worker_tasks.extend([
+            listener_task,
+            listener_nostr_upload_task,
+            listener_neo4j_write_task,
+            listener_ongoing_job_task,
+            fail_stale_ongoing_task,
+        ])
     else:
-        logger.info(
-            "Skipping intial nostr relay full sync... if you want to do it, modify the env variables and restart."
-        )
-    # start the regular update cronjob task
-    # regular_update_task = asyncio.create_task(nostr_event_recent_transferer_cronjob())
-
-    # Start the listener task
-    listener_task = asyncio.create_task(consume_messages())
-    listener_nostr_upload_task = asyncio.create_task(consume_nostr_upload_messages())
-    listener_neo4j_write_task = asyncio.create_task(consume_neo4j_write_messages())
-    listener_ongoing_job_task = asyncio.create_task(consume_job_started_messages())
-    fail_stale_ongoing_task = asyncio.create_task(
-        fail_stale_ongoing_brainstorm_requests_cronjob()
-    )
+        logger.info("Workers disabled (RUN_WORKERS=false) - running in API-only mode")
 
     try:
         yield
     finally:
         # Graceful shutdown
-        listener_task.cancel()
-        listener_nostr_upload_task.cancel()
-        listener_neo4j_write_task.cancel()
-        listener_ongoing_job_task.cancel()
-        consume_strfry_plugin_messages_task.cancel()
-        fail_stale_ongoing_task.cancel()
-        # regular_update_task.cancel()
+        logger.info("Shutting down workers...")
+        for task in worker_tasks:
+            task.cancel()
+        if worker_tasks:
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
 
 
-app = FastAPI(
-    title="brainstorm_api",
-    description="",
-    version="0.1.0",
-    openapi_url=openapi_url,
-    docs_url=docs_url,
-    redoc_url=redoc_url,
-    swagger_ui_oauth2_redirect_url=swagger_ui_oauth2_redirect_url,
-    lifespan=lifespan,
-)
-
-origins = ["*"]
-if settings.deploy_environment != "LOCAL":
-    logger.info("Setting specific CORS origin...")
-    origins = [settings.frontend_url]
-
-logger.info("Allowing CORS...")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=False,  # TODO: REMOVE THIS ONCE NEEDED
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.middleware(middleware_type="http")
-async def log_requests(request: Request, call_next):
-    idem = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    logger.info(f"rid={idem} start request path={request.url.path}")
-    start_time = time.time()
-
-    response = await call_next(request)
-
-    process_time = (time.time() - start_time) * 1000
-    formatted_process_time = "{0:.2f}".format(process_time)
-    logger.info(
-        f"rid={idem} completed_in="
-        f"{formatted_process_time}ms status_code={response.status_code}"
+if settings.run_api_server:
+    logger.info("Starting API server...")
+    app = FastAPI(
+        title="brainstorm_api",
+        description="",
+        version="0.1.0",
+        openapi_url=openapi_url,
+        docs_url=docs_url,
+        redoc_url=redoc_url,
+        swagger_ui_oauth2_redirect_url=swagger_ui_oauth2_redirect_url,
+        lifespan=lifespan,
     )
-    return response
+else:
+    logger.info("API server disabled (RUN_API_SERVER=false) - running in worker-only mode")
+    # Create a minimal app that only runs the lifespan for workers
+    app = FastAPI(
+        title="brainstorm_worker",
+        description="Worker-only mode",
+        version="0.1.0",
+        openapi_url=None,
+        docs_url=None,
+        redoc_url=None,
+        lifespan=lifespan,
+    )
+
+# Only configure API-specific middleware and routes if running API server
+if settings.run_api_server:
+    origins = ["*"]
+    if settings.deploy_environment != "LOCAL":
+        logger.info("Setting specific CORS origin...")
+        origins = [settings.frontend_url]
+
+    logger.info("Allowing CORS...")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=False,  # TODO: REMOVE THIS ONCE NEEDED
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
-@app.get(path="/health")
-async def health_endpoint() -> int:
-    return 1
+    @app.middleware(middleware_type="http")
+    async def log_requests(request: Request, call_next):
+        idem = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        logger.info(f"rid={idem} start request path={request.url.path}")
+        start_time = time.time()
+
+        response = await call_next(request)
+
+        process_time = (time.time() - start_time) * 1000
+        formatted_process_time = "{0:.2f}".format(process_time)
+        logger.info(
+            f"rid={idem} completed_in="
+            f"{formatted_process_time}ms status_code={response.status_code}"
+        )
+        return response
 
 
-app.include_router(
-    router=main_router,
-    prefix="",
-)
+    @app.get(path="/health")
+    async def health_endpoint() -> int:
+        return 1
 
-if settings.deploy_environment == "LOCAL":
-    add_sql_admin_panel(app)
 
-add_pagination(app)
+    app.include_router(
+        router=main_router,
+        prefix="",
+    )
+
+    if settings.deploy_environment == "LOCAL":
+        add_sql_admin_panel(app)
+
+    add_pagination(app)
+else:
+    # Worker-only mode: just add a basic health endpoint
+    @app.get(path="/health")
+    async def health_endpoint() -> int:
+        return 1
